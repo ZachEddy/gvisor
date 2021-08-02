@@ -18,23 +18,22 @@
 package cmd
 
 import (
-	"fmt"
 	"io/ioutil"
 	"os"
-	"strings"
 	"testing"
 
+	"github.com/google/subcommands"
 	"gvisor.dev/gvisor/runsc/mitigate/mock"
 )
 
 type executeTestCase struct {
-	name          string
-	mitigateData  string
-	mitigateError error
-	mitigateCPU   int
-	reverseData   string
-	reverseError  error
-	reverseCPU    int
+	name                   string
+	mitigateData           string
+	mitigateError          subcommands.ExitStatus
+	mitigateExpectedOutput string
+	reverseData            string
+	reverseError           subcommands.ExitStatus
+	reverseExpectedOutput  string
 }
 
 func TestExecute(t *testing.T) {
@@ -51,18 +50,18 @@ power management:
 
 	for _, tc := range []executeTestCase{
 		{
-			name:         "CascadeLake4",
-			mitigateData: mock.CascadeLake4.MakeCPUString(),
-			mitigateCPU:  2,
-			reverseData:  mock.CascadeLake4.MakeSysPossibleString(),
-			reverseCPU:   4,
+			name:                   "CascadeLake4",
+			mitigateData:           mock.CascadeLake4.MakeMitigatedCPUString(),
+			mitigateExpectedOutput: "off",
+			reverseData:            mock.CascadeLake4.MakeCPUString(),
+			reverseExpectedOutput:  "on",
 		},
 		{
 			name:          "Empty",
 			mitigateData:  "",
-			mitigateError: fmt.Errorf(`mitigate operation failed: no cpus found for: ""`),
-			reverseData:   "",
-			reverseError:  fmt.Errorf(`reverse operation failed: mismatch regex from possible: ""`),
+			mitigateError: Errorf(`mitigate operation failed: no cpus found for: ""`),
+			reverseData:   "somethingNotCPU",
+			reverseError:  Errorf(`mitigate operation failed: no cpus found for: ""`),
 		},
 		{
 			name: "Partial",
@@ -78,84 +77,66 @@ bugs            : sysret_ss_attrs spectre_v1 spectre_v2 spec_store_bypass
 power management::84
 
 ` + partial,
-			mitigateError: fmt.Errorf(`mitigate operation failed: failed to match key "core id": %q`, partial),
-			reverseData:   "1-",
-			reverseError:  fmt.Errorf(`reverse operation failed: mismatch regex from possible: %q`, "1-"),
+			mitigateError: Errorf(`mitigate operation failed: failed to match key "core id": %q`, partial),
+			reverseError:  Errorf(`reverse operation failed: mismatch regex from possible: %q`, "1-"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &Mitigate{
-				dryRun: true,
-			}
-			m.doExecuteTest(t, "Mitigate", tc.mitigateData, tc.mitigateCPU, tc.mitigateError)
+			m := &Mitigate{}
+			t.Run("Mitigate", func(t *testing.T) {
+				m.doExecuteTest(t, tc.mitigateData, tc.mitigateExpectedOutput, tc.mitigateError)
+			})
 
+			if tc.reverseData == "" {
+				tc.reverseData = tc.mitigateData
+			}
 			m.reverse = true
-			m.doExecuteTest(t, "Reverse", tc.reverseData, tc.reverseCPU, tc.reverseError)
+			t.Run("Reverse", func(t *testing.T) {
+				m.doExecuteTest(t, tc.reverseData, tc.reverseExpectedOutput, tc.reverseError)
+			})
 		})
 	}
 }
 
-func TestExecuteSmoke(t *testing.T) {
-	smokeMitigate, err := ioutil.ReadFile(cpuInfo)
-	if err != nil {
-		t.Fatalf("Failed to read %s: %v", cpuInfo, err)
-	}
-
-	m := &Mitigate{
-		dryRun: true,
-	}
-
-	m.doExecuteTest(t, "Mitigate", string(smokeMitigate), 0, nil)
-
-	smokeReverse, err := ioutil.ReadFile(allPossibleCPUs)
-	if err != nil {
-		t.Fatalf("Failed to read %s: %v", allPossibleCPUs, err)
-	}
-
-	m.reverse = true
-	m.doExecuteTest(t, "Reverse", string(smokeReverse), 0, nil)
-}
-
 // doExecuteTest runs Execute with the mitigate operation and reverse operation.
-func (m *Mitigate) doExecuteTest(t *testing.T, name, data string, want int, wantErr error) {
-	t.Run(name, func(t *testing.T) {
-		file, err := ioutil.TempFile("", "outfile.txt")
-		if err != nil {
-			t.Fatalf("Failed to create tmpfile: %v", err)
-		}
-		defer os.Remove(file.Name())
-
-		if _, err := file.WriteString(data); err != nil {
-			t.Fatalf("Failed to write to file: %v", err)
-		}
-
-		// Set fields for mitigate and dryrun to keep test hermetic.
-		m.path = file.Name()
-
-		set, err := m.doExecute()
-		if err = checkErr(wantErr, err); err != nil {
-			t.Fatalf("Mitigate error mismatch: %v", err)
-		}
-
-		// case where test should end in error or we don't care
-		// about how many cpus are returned.
-		if wantErr != nil || want < 1 {
-			return
-		}
-		got := len(set.GetRemainingList())
-		if want != got {
-			t.Fatalf("Failed wrong number of remaining CPUs: want %d, got %d", want, got)
-		}
-
-	})
-}
-
-// checkErr checks error for equality.
-func checkErr(want, got error) error {
-	switch {
-	case want == nil && got == nil:
-	case want == nil || got == nil || want.Error() != strings.Trim(got.Error(), " "):
-		return fmt.Errorf("got: %v want: %v", got, want)
+func (m *Mitigate) doExecuteTest(t *testing.T, data, wantSmt string, wantErr subcommands.ExitStatus) {
+	cpuInfo, err := ioutil.TempFile("", "cpuInfo.txt")
+	if err != nil {
+		t.Fatalf("Failed to create tmpfile: %v", err)
 	}
-	return nil
+	defer os.Remove(cpuInfo.Name())
+
+	if _, err := cpuInfo.WriteString(data); err != nil {
+		t.Fatalf("Failed to write to file: %v", err)
+	}
+
+	smtFile, err := ioutil.TempFile("", "smt.txt")
+	if err != nil {
+		t.Fatalf("Failed to create tmpfile: %v", err)
+	}
+	defer os.Remove(smtFile.Name())
+
+	if _, err := smtFile.WriteString("on"); err != nil {
+		t.Fatalf("Failed to write to file: %v", err)
+	}
+
+	subError := m.doExecute(cpuInfo.Name(), smtFile.Name())
+	if subError != wantErr {
+		t.Fatalf("Mitigate error mismatch: want: %v got: %v", wantErr, subError)
+	}
+
+	// case where test should end in error or we don't care
+	// about how many cpus are returned.
+	if wantErr != subcommands.ExitSuccess {
+		return
+	}
+
+	got, err := ioutil.ReadFile(smtFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to read to file: %v", err)
+	}
+
+	if string(got) != wantSmt {
+		t.Fatalf("Want smt file: want %s got: %s", wantSmt, got)
+	}
 }

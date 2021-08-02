@@ -28,6 +28,7 @@ type CPU struct {
 	PhysicalCores  int
 	Cores          int
 	ThreadsPerCore int
+	IsVulnerable   bool
 }
 
 // CascadeLake2 is a two core Intel CascadeLake machine.
@@ -41,6 +42,7 @@ var CascadeLake2 = CPU{
 	PhysicalCores:  1,
 	Cores:          1,
 	ThreadsPerCore: 2,
+	IsVulnerable:   true,
 }
 
 // CascadeLake4 is a four core Intel CascadeLake machine.
@@ -54,6 +56,7 @@ var CascadeLake4 = CPU{
 	PhysicalCores:  1,
 	Cores:          2,
 	ThreadsPerCore: 2,
+	IsVulnerable:   true,
 }
 
 // Haswell2 is a two core Intel Haswell machine.
@@ -67,6 +70,7 @@ var Haswell2 = CPU{
 	PhysicalCores:  1,
 	Cores:          1,
 	ThreadsPerCore: 2,
+	IsVulnerable:   true,
 }
 
 // Haswell2core is a 2 core Intel Haswell machine with no hyperthread pairs.
@@ -80,6 +84,7 @@ var Haswell2core = CPU{
 	PhysicalCores:  2,
 	Cores:          1,
 	ThreadsPerCore: 1,
+	IsVulnerable:   true,
 }
 
 // AMD2 is an two core AMD machine.
@@ -110,6 +115,18 @@ var AMD8 = CPU{
 
 // MakeCPUString makes a string formated like /proc/cpuinfo for each cpuTestCase
 func (tc CPU) MakeCPUString() string {
+	return tc.doMakeCPUString(tc.PhysicalCores, tc.Cores, tc.ThreadsPerCore)
+}
+
+// MakeMitigatedCPUString returns a /proc/cpuinfo for the machine assuming a mitigate function was successful.
+func (tc CPU) MakeMitigatedCPUString() string {
+	if tc.IsVulnerable {
+		return tc.doMakeCPUString(tc.PhysicalCores, tc.Cores, 1 /*ThreadsPerCore*/)
+	}
+	return tc.MakeCPUString()
+}
+
+func (tc CPU) doMakeCPUString(physicalCores, cores, threadsPerCore int) string {
 	template := `processor	: %d
 vendor_id	: %s
 cpu family	: %d
@@ -123,10 +140,10 @@ bugs		: %s
 `
 
 	ret := ``
-	for i := 0; i < tc.PhysicalCores; i++ {
-		for j := 0; j < tc.Cores; j++ {
-			for k := 0; k < tc.ThreadsPerCore; k++ {
-				processorNum := (i*tc.Cores+j)*tc.ThreadsPerCore + k
+	for i := 0; i < physicalCores; i++ {
+		for j := 0; j < cores; j++ {
+			for k := 0; k < threadsPerCore; k++ {
+				processorNum := (i*cores+j)*threadsPerCore + k
 				ret += fmt.Sprintf(template,
 					processorNum, /*processor*/
 					tc.VendorID,  /*vendor_id*/
@@ -144,11 +161,7 @@ bugs		: %s
 	return ret
 }
 
-// MakeSysPossibleString makes a string representing a the contents of /sys/devices/system/cpu/possible.
-func (tc CPU) MakeSysPossibleString() string {
-	max := tc.PhysicalCores * tc.Cores * tc.ThreadsPerCore
-	if max == 1 {
-		return "0"
-	}
-	return fmt.Sprintf("0-%d", max-1)
+// NumCPUs returns the number of CPUs for this CPU.
+func (tc CPU) NumCPUs() int {
+	return tc.PhysicalCores * tc.Cores * tc.ThreadsPerCore
 }

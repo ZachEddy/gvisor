@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"runtime"
 
 	"github.com/google/subcommands"
@@ -29,8 +30,8 @@ import (
 const (
 	// cpuInfo is the path used to parse CPU info.
 	cpuInfo = "/proc/cpuinfo"
-	// allPossibleCPUs is the path used to enable CPUs.
-	allPossibleCPUs = "/sys/devices/system/cpu/possible"
+	// Path to shutdown a CPU.
+	smtPath = "/sys/devices/system/cpu/smt/control"
 )
 
 // Mitigate implements subcommands.Command for the "mitigate" command.
@@ -39,8 +40,6 @@ type Mitigate struct {
 	dryRun bool
 	// Reverse mitigate by turning on all CPU cores.
 	reverse bool
-	// Path to file to read to create CPUSet.
-	path string
 	// Extra data for post mitigate operations.
 	data string
 }
@@ -59,9 +58,9 @@ func (*Mitigate) Synopsis() string {
 func (m Mitigate) Usage() string {
 	return fmt.Sprintf(`mitigate [flags]
 
-mitigate mitigates a system to the "MDS" vulnerability by implementing a manual shutdown of SMT. The command checks /proc/cpuinfo for cpus having the MDS vulnerability, and if found, shutdown all but one CPU per hyperthread pair via /sys/devices/system/cpu/cpu{N}/online. CPUs can be restored by writing "2" to each file in /sys/devices/system/cpu/cpu{N}/online or performing a system reboot.
+mitigate mitigates a system to the "MDS" vulnerability by writing "off" to /sys/devices/system/cpu/smt/control. CPUs can be restored by writing "on" to the same file or rebooting your system.
 
-The command can be reversed with --reverse, which reads the total CPUs from /sys/devices/system/cpu/possible and enables all with /sys/devices/system/cpu/cpu{N}/online.%s`, m.usage())
+The command can be reversed with --reverse, which writes "off" to the file above.%s`, m.usage())
 }
 
 // SetFlags sets flags for the command Mitigate.
@@ -82,96 +81,79 @@ func (m *Mitigate) Execute(_ context.Context, f *flag.FlagSet, args ...interface
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
+	return m.doExecute(cpuInfo, smtPath)
+}
 
-	m.path = cpuInfo
-	if m.reverse {
-		m.path = allPossibleCPUs
-	}
-
-	set, err := m.doExecute()
+func (m *Mitigate) doExecute(cpuInfoPath, smtFilePath string) subcommands.ExitStatus {
+	beforeSet, err := getCPUSet(cpuInfoPath)
 	if err != nil {
-		return Errorf("Execute failed: %v", err)
+		return Errorf("Get before CPUSet failed: %v", err)
+	}
+	log.Infof("CPUs before: %s", beforeSet.String())
+
+	action := doMitigate
+	if m.reverse {
+		action = doReverse
 	}
 
-	if m.data == "" {
-		return subcommands.ExitSuccess
+	// dryRun should skip any mitigate action.
+	if m.dryRun {
+		action = func(_ string, _ mitigate.CPUSet) error {
+			return nil
+		}
 	}
 
-	if err = m.postMitigate(set); err != nil {
+	if err := action(smtFilePath, beforeSet); err != nil {
+		return Errorf("Action failed: %v", err)
+	}
+	afterSet, err := getCPUSet(cpuInfoPath)
+	if err != nil {
+		return Errorf("Get after CPUSet failed: %v", err)
+	}
+	log.Infof("CPUs after: %s", afterSet.String())
+
+	if err = m.postMitigate(afterSet); err != nil {
 		return Errorf("Post Mitigate failed: %v", err)
 	}
 
 	return subcommands.ExitSuccess
 }
 
-// Execute executes the Mitigate command.
-func (m *Mitigate) doExecute() (mitigate.CPUSet, error) {
-	if m.dryRun {
-		log.Infof("Running with DryRun. No cpu settings will be changed.")
-	}
-	data, err := ioutil.ReadFile(m.path)
+// getCPUSet gets the current CPUSet and prints it.
+func getCPUSet(path string) (mitigate.CPUSet, error) {
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", m.path, err)
+		return nil, fmt.Errorf("failed to read %s: %w", path, err)
 	}
-	if m.reverse {
-		set, err := m.doReverse(data)
-		if err != nil {
-			return nil, fmt.Errorf("reverse operation failed: %w", err)
-		}
-		return set, nil
-	}
-	set, err := m.doMitigate(data)
-	if err != nil {
-		return nil, fmt.Errorf("mitigate operation failed: %w", err)
-	}
-	return set, nil
+	return mitigate.NewCPUSet(string(data))
 }
 
-func (m *Mitigate) doMitigate(data []byte) (mitigate.CPUSet, error) {
-	set, err := mitigate.NewCPUSet(data)
-	if err != nil {
-		return nil, err
+// doMitigate turns off SMT by writing "off" to /sys/devices/cpu/smt/control.
+func doMitigate(filePath string, cpuSet mitigate.CPUSet) error {
+	if !cpuSet.IsVulnerable() {
+		return nil
 	}
-
-	log.Infof("Mitigate found the following CPUs...")
-	log.Infof("%s", set)
-
-	disableList := set.GetShutdownList()
-	log.Infof("Disabling threads on thread pairs.")
-	for _, t := range disableList {
-		log.Infof("Disable thread: %s", t)
-		if m.dryRun {
-			continue
-		}
-		if err := t.Disable(); err != nil {
-			return nil, fmt.Errorf("error disabling thread: %s err: %w", t, err)
-		}
+	if err := doEnableDisable(filePath, "off"); err != nil {
+		return fmt.Errorf("disable: %v", err)
 	}
-	log.Infof("Shutdown successful.")
-	return set, nil
+	return nil
 }
 
-func (m *Mitigate) doReverse(data []byte) (mitigate.CPUSet, error) {
-	set, err := mitigate.NewCPUSetFromPossible(data)
+// doReverse turns on the SMT by writing "on" to /sys/devices/cpu/smt/control.
+func doReverse(filePath string, _ mitigate.CPUSet) error {
+	if err := doEnableDisable(filePath, "on"); err != nil {
+		return fmt.Errorf("enable: %v", err)
+	}
+	return nil
+}
+
+func doEnableDisable(filePath, action string) error {
+	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to open file %s: %v", smtPath, err)
 	}
-
-	log.Infof("Reverse mitigate found the following CPUs...")
-	log.Infof("%s", set)
-
-	enableList := set.GetRemainingList()
-
-	log.Infof("Enabling all CPUs...")
-	for _, t := range enableList {
-		log.Infof("Enabling thread: %s", t)
-		if m.dryRun {
-			continue
-		}
-		if err := t.Enable(); err != nil {
-			return nil, fmt.Errorf("error enabling thread: %s err: %w", t, err)
-		}
+	if _, err = f.Write([]byte(action)); err != nil {
+		return fmt.Errorf("failed to write \"%s\" to %s: %v", action, smtPath, err)
 	}
-	log.Infof("Enable successful.")
-	return set, nil
+	return nil
 }
